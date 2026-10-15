@@ -2674,6 +2674,13 @@ format_cb_pane_synchronized(struct format_tree *ft)
 	return (NULL);
 }
 
+/* Plain ASCII state/kind/progress: no application-controlled format markup. */
+static void *
+format_cb_pane_program_status(struct format_tree *ft)
+{
+	return (ft->wp == NULL ? NULL : xstrdup(input_program_status(ft->wp->ictx)));
+}
+
 /* Callback for pane_title. */
 static void *
 format_cb_pane_title(struct format_tree *ft)
@@ -3944,6 +3951,9 @@ static const struct format_table_entry format_table[] = {
 	},
 	{ "pane_private_modes", FORMAT_TABLE_STRING,
 	  format_cb_pane_private_modes
+	},
+	{ "pane_program_status", FORMAT_TABLE_STRING,
+	  format_cb_pane_program_status
 	},
 	{ "pane_right", FORMAT_TABLE_STRING,
 	  format_cb_pane_right

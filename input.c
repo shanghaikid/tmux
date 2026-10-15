@@ -27,6 +27,7 @@
 #include <time.h>
 
 #include "tmux.h"
+#include "contrib/program-status/program_status.h"
 
 /*
  * Based on the description by Paul Williams at:
@@ -145,7 +146,44 @@ struct input_ctx {
 	 */
 	struct evbuffer			*since_ground;
 	struct event			 ground_timer;
+	void			       *program_status;
+	struct event			 status_timer;
+	int				 status_sequence;
+	int				 status_escape;
 };
+
+static void input_status_byte(struct input_ctx *);
+static void input_status_schedule(struct input_ctx *);
+static void
+input_status_timer_callback(__unused int fd, __unused short events, void *arg)
+{
+	struct input_ctx *ictx = arg;
+	if (ictx->wp != NULL) {
+		server_status_window(ictx->wp->window);
+		server_redraw_window_borders(ictx->wp->window);
+	}
+}
+
+static void
+input_status_schedule(struct input_ctx *ictx)
+{
+	struct timeval tv = { .tv_sec = 0, .tv_usec = 100000 };
+	if (!evtimer_pending(&ictx->status_timer, NULL))
+		evtimer_add(&ictx->status_timer, &tv);
+}
+
+const char *
+input_program_status(struct input_ctx *ictx)
+{
+	return (ictx == NULL ? "" : ps_label(ictx->program_status));
+}
+
+void
+input_program_status_expire(struct window_pane *wp)
+{
+	if (wp->ictx != NULL && ps_expire(wp->ictx->program_status, 0))
+		input_status_schedule(wp->ictx);
+}
 
 /* Helper functions. */
 struct input_transition;
@@ -891,6 +929,7 @@ input_init(struct window_pane *wp, struct bufferevent *bev,
 	if (ictx->since_ground == NULL)
 		fatalx("out of memory");
 	evtimer_set(&ictx->ground_timer, input_ground_timer_callback, ictx);
+	evtimer_set(&ictx->status_timer, input_status_timer_callback, ictx);
 
 	TAILQ_INIT(&ictx->requests);
 	evtimer_set(&ictx->request_timer, input_request_timer_callback, ictx);
@@ -915,6 +954,8 @@ input_free(struct input_ctx *ictx)
 		input_free_request(ir);
 	event_del(&ictx->request_timer);
 
+	event_del(&ictx->status_timer);
+	ps_free(ictx->program_status);
 	free(ictx->input_buf);
 	evbuffer_free(ictx->since_ground);
 	event_del(&ictx->ground_timer);
@@ -978,6 +1019,18 @@ input_parse(struct input_ctx *ictx, const u_char *buf, size_t len)
 	/* Parse the input. */
 	while (off < len) {
 		ictx->ch = buf[off++];
+		if (ictx->state == &input_state_osc_string && ictx->status_sequence) {
+			if (ictx->status_escape && ictx->ch != '\\') {
+				/* Abort an incomplete ST and parse its following escape normally. */
+				input_clear(ictx);
+				ictx->state = &input_state_esc_enter;
+				off--;
+			} else
+				input_status_byte(ictx);
+			state = NULL;
+			itr = NULL;
+			continue;
+		}
 
 		/* Find the transition. */
 		if (ictx->state != state ||
@@ -1020,7 +1073,7 @@ input_parse(struct input_ctx *ictx, const u_char *buf, size_t len)
 			input_set_state(ictx, itr);
 
 		/* If not in ground state, save input. */
-		if (ictx->state != &input_state_ground)
+		if (ictx->state != &input_state_ground && !ictx->status_sequence)
 			evbuffer_add(ictx->since_ground, &ictx->ch, 1);
 	}
 }
@@ -1071,6 +1124,8 @@ input_parse_buffer(struct window_pane *wp, const u_char *buf, size_t len)
 	    ictx->state->name, len, (int)len, buf);
 
 	input_parse(ictx, buf, len);
+	if (wp->flags & PANE_EXITED)
+		input_program_status_expire(wp);
 	screen_write_stop(sctx);
 }
 
@@ -1206,6 +1261,8 @@ input_clear(struct input_ctx *ictx)
 
 	*ictx->input_buf = '\0';
 	ictx->input_len = 0;
+	ictx->status_sequence = 0;
+	ictx->status_escape = 0;
 
 	ictx->input_end = INPUT_END_ST;
 
@@ -1219,7 +1276,7 @@ input_ground(struct input_ctx *ictx)
 	event_del(&ictx->ground_timer);
 	evbuffer_drain(ictx->since_ground, EVBUFFER_LENGTH(ictx->since_ground));
 
-	if (ictx->input_space > INPUT_BUF_START) {
+	if (ictx->input_space > INPUT_BUF_START && !ictx->status_sequence) {
 		ictx->input_space = INPUT_BUF_START;
 		ictx->input_buf = xrealloc(ictx->input_buf, INPUT_BUF_START);
 	}
@@ -1284,6 +1341,14 @@ input_input(struct input_ctx *ictx)
 {
 	size_t available;
 
+	if (ictx->status_sequence && ((ictx->flags & INPUT_DISCARD) ||
+	    ictx->input_len >= 4093)) {
+		ictx->flags |= INPUT_DISCARD;
+		return (0);
+	}
+	if (ictx->state == &input_state_osc_string && ictx->input_len == 4 &&
+	    memcmp(ictx->input_buf, "7501", 4) == 0 && ictx->ch == ';')
+		ictx->status_sequence = 1;
 	available = ictx->input_space;
 	while (ictx->input_len + 1 >= available) {
 		available *= 2;
@@ -1298,6 +1363,30 @@ input_input(struct input_ctx *ictx)
 	ictx->input_buf[ictx->input_len] = '\0';
 
 	return (0);
+}
+
+/* OSC 7501 has bounded atomic termination, unlike legacy OSC title handling. */
+static void
+input_status_byte(struct input_ctx *ictx)
+{
+	if (ictx->status_escape || ictx->ch == 7 || ictx->ch == 24 || ictx->ch == 26) {
+		if (ictx->status_escape) {
+			ictx->input_end = INPUT_END_ST;
+			if (ictx->input_len > 4092)
+				ictx->flags |= INPUT_DISCARD;
+		} else if (ictx->ch == 7)
+			ictx->input_end = INPUT_END_BEL;
+		else
+			ictx->flags |= INPUT_DISCARD;
+		input_exit_osc(ictx);
+		ictx->state = &input_state_ground;
+		input_ground(ictx);
+		ictx->status_sequence = 0;
+		ictx->status_escape = 0;
+	} else if (ictx->ch == 27)
+		ictx->status_escape = 1;
+	else
+		input_input(ictx);
 }
 
 /* Execute C0 control sequence. */
@@ -1405,6 +1494,8 @@ input_esc_dispatch(struct input_ctx *ictx)
 
 	switch (entry->type) {
 	case INPUT_ESC_RIS:
+		if (ps_expire(ictx->program_status, 1))
+			input_status_schedule(ictx);
 		colour_palette_clear(ictx->palette);
 		input_reset_cell(ictx);
 		screen_write_reset(sctx);
@@ -2769,7 +2860,28 @@ input_exit_osc(struct input_ctx *ictx)
 	case 112:
 		input_osc_112(ictx, p);
 		break;
+	case 7501:
+		if (!ictx->status_sequence)
+			break;
+		if (ictx->program_status == NULL)
+			ictx->program_status = ps_new();
+		switch (ps_apply(ictx->program_status, p,
+		    ictx->input_len - (p - ictx->input_buf),
+		    ictx->input_end == INPUT_END_BEL)) {
+		case 1:
+			input_status_schedule(ictx);
+			break;
+		case 2:
+			input_send_reply(ictx, ictx->input_end == INPUT_END_BEL ?
+		    "\033]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\007" :
+		    "\033]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\033\\");
+			break;
+		}
+		break;
 	case 133:
+		if (*p == 'A' && (p[1] == 0 || p[1] == ';') &&
+		    ps_expire(ictx->program_status, 0))
+			input_status_schedule(ictx);
 		input_osc_133(ictx, p);
 		break;
 	default:

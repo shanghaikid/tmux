@@ -501,6 +501,7 @@ server_child_exited(pid_t pid, int status)
 
 				log_debug("%%%u exited", wp->id);
 				wp->flags |= PANE_EXITED;
+				input_program_status_expire(wp);
 
 				window_pane_wait_finish(wp);
 				spawn_editor_finish(wp);

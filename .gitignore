@@ -25,3 +25,5 @@ regress/logs/
 tags
 tmux
 tmux.1.*
+
+.build/

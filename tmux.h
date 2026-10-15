@@ -3440,6 +3440,8 @@ void	 recalculate_sizes_now(int);
 struct input_ctx *input_init(struct window_pane *, struct bufferevent *,
 	     struct colour_palette *, struct client *);
 void	 input_free(struct input_ctx *);
+const char *input_program_status(struct input_ctx *);
+void input_program_status_expire(struct window_pane *);
 void	 input_reset(struct input_ctx *, int);
 struct evbuffer *input_pending(struct input_ctx *);
 void	 input_parse_pane(struct window_pane *);
